@@ -6,7 +6,7 @@
 
 衡尺文化发行社有20位经营分析与渠道同事。过去每周复制各渠道结算表，分析师各自定义净收入，再人工逐份发送。指标依赖不透明、维度差异找不到根源、定时交付没有证据是主要痛点。上游为合成渠道结算明细，本应用替代口径定义、透视重算和核对交付段，下游是站内阅读者；无外部邮件或真实财务操作。
 
-来源 `hengchi-settlement-202611.csv` 对应1800条固定seed 73合成数据，覆盖2026-09/10、直营渠道/书店合作/数字发行、华东/华北/华南。参考账本在书店合作2026-10的300条明细中各多计2.5元，用于展示可解释的750元差异，非真实客户数据。
+来源 `hengchi-settlement-202611.csv` 对应1800条固定seed 73合成数据，覆盖2026-09/10、直营渠道/书店合作/数字发行、华东/华北/华南。参考账本在书店合作2026-10的300条明细中各多计2.5元，用于展示可解释的750元差异，非真实客户数据。来源核对页还可导入独立账本事件：账单编号即来源编号，按原单→差额更正→撤销的版本链双向核对，见下文“独立账本”。
 
 | 角色 | 页面与权限 | 典型动作 |
 |---|---|---|
@@ -36,7 +36,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 ## 一天的工作剧本
 
 1. 09:00 宋予以analyst登录，检查1800条来源与基准透视。
-2. 09:05 在来源核对发现书店合作2026-10的参考账本多计750元，查看300条来源的归因。
+2. 09:05 在来源核对发现书店合作2026-10的参考账本多计750元，查看300条来源的归因；再导入一批独立账本事件，核对待补齐、双方缺单与金额差异。
 3. 09:10 陆知衡以admin登录，在指标口径登记 `profit_per_order = gross_profit / orders`，说明先汇总再计算。
 4. 09:15 宋予创建“11月渠道经营核对”，选择渠道×月份，提交异步计算。
 5. worker消费队列，按冻结口径和来源生成6个维度单元及重算合计，结果保存表达式快照与来源SHA256。
@@ -45,6 +45,24 @@ docker compose exec -T backend python -m scripts.seed_demo
 8. worker在时间到期时独立创建新运行、重算并生成Delivery；第2周期再生成另一份记录。
 9. 叶言以viewer打开站内交付箱，查看对应报表并导出，无法创建计划或修改口径。
 10. 演示后暂停分钟计划，在校对留痕检查schedule.due与report.delivered记录。
+
+## 独立账本与双向核对
+
+来源核对页新增独立账本：账单编号与来源编号一一对应，每张账单的版本从 1 连续递增，事件三类——原单（v1，设定金额）、金额差额更正（v2..n，累加有符号差额）、撤销（净额归零并结束该单版本链）。后端 `utils/ledger_rules.py` 的 `replay()` 是唯一投影规则，`ledger_bills` 只是事件日志的缓存；每次导入都从完整事件日志重新投影，因此重放、并发与重启不会让金额漂移。
+
+| 情形 | 行为 |
+|---|---|
+| 后序先到（如 v3 早于 v2） | v1 已到则先记到断点；缺失版本显示“待补齐”，金额停在已连续应用的前缀 |
+| 前序补齐 | 同一账单自动从断点连续应用，无需手工重算 |
+| 重复事件（同版本同内容） | 视为重复，不重复改金额，批次回执记重复数 |
+| 同版本异文 | 整批拒绝，本批任何事件都不写入；预留记录标记 rejected 并保留原因 |
+| 撤销后再到旧事件 | 已应用版本只计重复；撤销版本之后的新版本只入日志、永不应用，旧事件不复活 |
+
+导入分两阶段提交：先把完整 payload 以批次标识写入 `ledger_imports(processing)` 预留，再用单个事务插入事件、重投影受影响账单并更新缓存。服务启动和 worker 每轮都会重放仍为 processing 的批次，因此进程中断后可从预留 payload 恢复；请求携带相同批次标识可重放已受理结果，同一标识不同内容返回 409。并发导入相邻版本时，PostgreSQL 用按账单编号的 `pg_advisory_xact_lock` 串行化同一账单的写入与投影（SQLite 单写者天然串行），后提交者重新读取已提交事件后再投影，最终金额与进度一致。
+
+`GET /ledger/reconciliation` 返回双向核对：`pending`（待补齐）、`source_missing`（账本有而来源无，即来源缺单）、`ledger_missing`（来源有而账本无，即账本缺单）、`amount_differences`（逐分比较的金额差异）、`cancelled`，另附前5条 matched 样本；“待补齐”按缺失版本数计，金额差异按绝对差额降序。核对与导入只读写独立账本表，不修改 `report_runs.result` 或已生成的 Delivery，历史交付始终显示当时快照。
+
+`POST /ledger/imports` 接受 `{batch_key, source, events:[{bill_no, version, kind, amount, occurred_at, memo}]}`，`kind` 为 `original/adjustment/reversal`；金额以分为单位校验后存储，事件最多2000条。仅 admin 与 analyst 可导入，viewer 只读核对结果。
 
 ## 真实计算
 
@@ -58,13 +76,13 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 ## 页面与架构
 
-六页为交付总览、指标口径、来源核对、透视报表、定时交付、校对留痕。核心实体Metric、SourceRow、ReportRun、DeliverySchedule、Delivery分别贯穿SQLAlchemy模型、schema、service、route、前端API、store和页面。`MetricFormula`跨总览与口径页共用；`PivotTable`封装快照透视，`DataTable`、`Notice`、`StatusBadge`跨页共用；hooks分离异步动作与自动刷新。
+六页为交付总览、指标口径、来源核对、透视报表、定时交付、校对留痕。核心实体Metric、SourceRow、ReportRun、DeliverySchedule、Delivery分别贯穿SQLAlchemy模型、schema、service、route、前端API、store和页面；独立账本实体LedgerEvent、LedgerBill、LedgerImport 同样贯穿 `routes/ledger.py`、`services/ledger_service.py`、`utils/ledger_rules.py`、`api/ledger.ts` 与来源核对页。`MetricFormula`跨总览与口径页共用；`PivotTable`封装快照透视，`DataTable`、`Notice`、`StatusBadge`跨页共用；hooks分离异步动作与自动刷新。
 
 | 部分 | 技术 |
 |---|---|
 | Backend | Python3.11 / FastAPI / SQLAlchemy / PyJWT |
 | Frontend | React18 / TypeScript / Vite / Noto Serif SC + Noto Sans SC |
-| 数据 | PostgreSQL16 / Redis7 AOF |
+| 数据 | PostgreSQL16 / Redis7 AOF / 独立账本事件表 |
 | 部署 | 恰好frontend/backend/worker/db/redis五服务，Nginx |
 
 ```
@@ -98,9 +116,9 @@ docker compose down -v --remove-orphans
 
 ## 验证与边界
 
-外置测试与截图位于`../../test-artifacts/gb-0005/`，含算法、API、真实周期和浏览器证据。源码不含截图/测试报告/日志，`.env`与日志不提交。
+外置测试与截图位于`../../test-artifacts/gb-0005/`，含算法、API、真实周期和浏览器证据。源码不含截图/测试报告/日志，`.env`与日志不提交。仓库内 `backend/tests` 覆盖账本规则（乱序、补齐、重复、异文整批拒绝、撤销后不复活）与 API（幂等重放、双向缺单、中断恢复、并发相邻版本），`cd backend && python3 -m pytest tests` 可在 SQLite 上离线运行。
 
-目前面向本地合成研究：无文件上传/外部邮件/多租户隔离；仅支持算术口径，不支持任意SQL或函数。单worker调度不提供多实例分布式锁；running任务崩溃需重新提交，数据库事务与Redis入队之间无事务outbox。金额采用浮点并在输出舍入，非财务总账记账引擎。表达式以当前定义计算且结果保存快照；未提供已注册指标编辑/删除，现有数据试算通过后才能登记，后续来源变化仍可能造成任务失败，结果页会显示错误。来源页最多预览100行，计算用全部来源。Google Fonts无网络会回退字体。
+目前面向本地合成研究：无文件上传/外部邮件/多租户隔离；仅支持算术口径，不支持任意SQL或函数。账本事件通过接口粘贴 JSON 导入，未提供 CSV 上传；撤销后迟到版本只保留审计日志，不参与金额。单worker调度不提供多实例分布式锁；running任务崩溃需重新提交，数据库事务与Redis入队之间无事务outbox。金额采用浮点并在输出舍入，非财务总账记账引擎。表达式以当前定义计算且结果保存快照；未提供已注册指标编辑/删除，现有数据试算通过后才能登记，后续来源变化仍可能造成任务失败，结果页会显示错误。来源页最多预览100行，计算用全部来源。Google Fonts无网络会回退字体。
 
 ## License
 

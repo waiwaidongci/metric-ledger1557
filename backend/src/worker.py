@@ -5,13 +5,16 @@ from .models import ReportRun,SourceRow,Metric,Delivery
 from .services.report_service import queue
 from .services.pivot_service import build_report
 from .services.scheduler_service import schedule_due
+from .services.ledger_service import resume_imports
 from .services.audit_service import log
 from .constants.status import RunStatus
 Base.metadata.create_all(engine);Path("/artifacts").mkdir(exist_ok=True)
 while True:
     Path("/artifacts/heartbeat").write_text(str(time.time()))
     try:
-        with SessionLocal() as db:schedule_due(db)
+        with SessionLocal() as db:
+            resume_imports(db)
+            schedule_due(db)
         job=queue.blpop("metric:jobs",timeout=2)
         if not job:continue
         with SessionLocal() as db:

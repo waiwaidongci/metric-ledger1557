@@ -1,9 +1,51 @@
 import random,json
 from datetime import datetime,timedelta,timezone,date
 from src.config.database import SessionLocal,Base,engine
-from src.models import User,Metric,SourceRow,ReportRun,DeliverySchedule,Delivery
+from src.models import User,Metric,SourceRow,ReportRun,DeliverySchedule,Delivery,LedgerImport
 from src.utils.security import hash_password
 from src.services.pivot_service import build_report
+from src.services.ledger_service import normalise_events,reserve_import,apply_import
+from src.constants.ledger import ImportStatus
+
+def _seed_ledger(db):
+    """A ledger matching the settlement source plus deliberate edge cases.
+
+    * every source bill except HC-000009 gets v1 = its reference net;
+    * HC-000002 gets v2 = +250 cents                    -> 金额差异 2.50;
+    * HC-000005 gets v2 = +5, v3 = -2, v4 = 撤销         -> 撤销单，金额归零;
+    * HC-000008 v2 is held back and arrives after v3     -> 先待补齐，后连续应用;
+    * HC-000012 is missing v2 entirely                   -> 页面上持续显示待补齐;
+    * HC-001801 exists only in the ledger                -> 来源缺单;
+    * HC-000009 has no ledger bill                       -> 账本缺单。
+    """
+    if db.query(LedgerImport).first() or db.query(SourceRow).count()==0:return
+    source={row.source_key:row for row in db.query(SourceRow).order_by(SourceRow.id).all()}
+    events=[]
+    for key,row in source.items():
+        if key in ("HC-000009",):continue
+        events.append({"bill_no":key,"version":1,"kind":"original","amount":round(row.reference_net,2),"occurred_at":row.day,"memo":"结算原单"})
+    def add(bill,version,kind,amount,memo,day="2026-10-31"):
+        events.append({"bill_no":bill,"version":version,"kind":kind,"amount":amount,"occurred_at":day,"memo":memo})
+    add("HC-000002",2,"adjustment",2.5,"来源偏差差额更正")
+    add("HC-000005",2,"adjustment",5.0,"补记渠道费")
+    add("HC-000005",3,"adjustment",-2.0,"费用更正")
+    add("HC-000005",4,"reversal",0,"整单撤销")
+    add("HC-000008",2,"adjustment",3.0,"晚到的第二版")
+    add("HC-000008",3,"adjustment",-3.0,"第二版缺失时先到的第三版")
+    add("HC-000012",3,"adjustment",-2.0,"第二版尚未收到，先到第三版")
+    add("HC-001801",1,"original",268.4,"独立账本原单，来源未同步")
+    payload=events
+    for index,chunk in enumerate([payload[:1200],payload[1200:1550],payload[1550:]]):
+        target=[event for event in chunk if not (event["bill_no"]=="HC-000008" and event["version"]==2)]
+        held=[event for event in chunk if event["bill_no"]=="HC-000008" and event["version"]==2]
+        _import(db,f"demo-seed-{index+1}",target,"系统种子")
+        if held:_import(db,f"demo-seed-{index+1}-late",held,"来源补发")
+    db.commit()
+
+def _import(db,batch_key,events,source):
+    payload,_=normalise_events(events)
+    row,existing=reserve_import(db,batch_key,payload,"seed@hengchi.demo",source)
+    if row.status==ImportStatus.PROCESSING:apply_import(row.id)
 
 def seed():
     Base.metadata.create_all(engine)
@@ -35,5 +77,6 @@ def seed():
             result=build_report(db.query(SourceRow).order_by(SourceRow.id).all(),db.query(Metric).order_by(Metric.id).all(),["channel","month"])
             run=ReportRun(name="11月经营口径核对 · 基准",dimensions=["channel","month"],status="completed",result=result,owner="宋予 · 经营分析师",schedule_id=schedules[0].id)
             db.add(run);db.flush();db.add(Delivery(schedule_id=schedules[0].id,run_id=run.id,title="经营周报 · 基准交付"))
-        db.commit();print(json.dumps({m.__tablename__:db.query(m).count() for m in [User,Metric,SourceRow,ReportRun,DeliverySchedule,Delivery]},ensure_ascii=False))
+        db.commit();_seed_ledger(db);db.commit()
+        print(json.dumps({m.__tablename__:db.query(m).count() for m in [User,Metric,SourceRow,ReportRun,DeliverySchedule,Delivery,LedgerImport]},ensure_ascii=False))
 if __name__=="__main__":seed()
